@@ -1,0 +1,526 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+/**
+ * Core Principles enforced by schema:
+ * - All household-owned data includes householdId
+ * - CanonicalItem is global (no householdId) and contains NO health data
+ * - Audit log is append-only (InventoryEvent)
+ * - Receipt ingestion is raw -> line items -> normalized -> review decision
+ */
+
+enum DecisionStatus {
+  PROPOSED
+  NEEDS_REVIEW
+  APPROVED
+  REJECTED
+  OVERRIDDEN
+}
+
+enum MatchMethod {
+  SKU
+  BARCODE
+  NAME_FUZZY
+  MANUAL
+  RULE
+}
+
+enum ActorType {
+  SYSTEM
+  USER
+  ADMIN
+  SUPPORT
+  IMPORT
+  SVC
+}
+
+enum ReceiptsStatus {
+  RECEIVED
+  PARSED
+  NORMALIZED
+  NEEDS_REVIEW
+  ERROR
+}
+
+enum HouseholdMemberRole {
+  OWNER
+  MEMBER
+}
+
+enum ReceiptStatus {
+  RECEIVED
+  PARSED
+  NEEDS_REVIEW
+  APPROVED
+  REJECTED
+}
+
+enum NormalizationStatus {
+  PENDING
+  MATCHED
+  NEEDS_REVIEW
+  REJECTED
+}
+
+enum InventoryEventType {
+  RECEIPT_INGESTED
+  RECEIPT_PARSED
+  NORMALIZATION_PROPOSED
+  NORMALIZATION_APPROVED
+  NORMALIZATION_REJECTED
+
+  LOT_CREATED
+  LOT_ADJUSTED
+  LOT_CONSUMED
+  LOT_EXPIRED
+  LOT_DISCARDED
+
+  ALIAS_CREATED
+  ALIAS_UPDATED
+
+  OPTIMIZATION_PROPOSED
+  OPTIMIZATION_APPROVED
+  OPTIMIZATION_REJECTED
+}
+
+enum OptimizationType {
+  USE_SOON_RECIPE
+  SUBSTITUTION
+  ROTATION_PLAN
+}
+
+enum OptimizationDecision {
+  PROPOSED
+  APPROVED
+  REJECTED
+  EXECUTED
+}
+
+model User {
+  id String @id @default(uuid())
+
+  // External identity mapping (Voravia is the issuer)
+  authProvider String // e.g. "voravia"
+  authSubject  String // JWT sub, e.g. "dev-user-1"
+  memberRef    String? // optional: Voravia members.memberId (if/when you include it)
+
+  // Optional profile fields (can be filled later)
+  email        String? @unique
+  displayName  String?
+  passwordHash String? // keep nullable; you likely won’t use it
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  memberships       HouseholdMember[]
+  events            InventoryEvent[]         @relation("EventActor")
+  decisions         OptimizationSuggestion[] @relation("DecisionActor")
+  normalizedReviews NormalizedLineItem[]     @relation("LineReviewer")
+
+  @@unique([authProvider, authSubject])
+  @@index([createdAt])
+}
+
+model Household {
+  id        String   @id @default(uuid())
+  name      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  members     HouseholdMember[]
+  receipts    ReceiptRaw[]
+  lots        InventoryLot[]
+  events      InventoryEvent[]
+  suggestions OptimizationSuggestion[]
+  aliases     ItemAlias[]
+  normalized  NormalizedLineItem[]
+
+  @@index([createdAt])
+}
+
+model HouseholdMember {
+  id          String              @id @default(uuid())
+  householdId String
+  userId      String
+  role        HouseholdMemberRole @default(MEMBER)
+  createdAt   DateTime            @default(now())
+
+  household Household @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([householdId, userId])
+  @@index([userId])
+}
+
+//
+// Canonical item system (global, no household)
+//
+
+model CanonicalItem {
+  id        String    @id @default(uuid())
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  // ✅ GLOBAL identity (LOCKED)
+  vendor    String
+  vendorSku String
+
+  // existing canonical fields
+  name        String
+  normalized  String // keep for search / display normalization (no longer globally unique)
+  description String?
+
+  // roleCode is for 1-1 substitutions (config-driven allowed)
+  roleCode        String? // e.g. "LEAN_PROTEIN", "FIBER"
+  // defaultUnitCode used when receipt lines omit units
+  defaultUnitCode String? // e.g. "g", "ml", "count"
+
+  // existing relations (keep)
+  proposedNormalizedLines NormalizedLineItem[] @relation("ProposedCanonicalItem")
+  finalNormalizedLines    NormalizedLineItem[] @relation("FinalCanonicalItem")
+
+  aliases ItemAlias[]
+  lots    InventoryLot[]
+
+  // ✅ indexes / uniqueness (LOCKED + perf)
+  @@unique([vendor, vendorSku])
+  @@index([name])
+  @@index([vendor])
+  @@index([roleCode])
+}
+
+model ItemAlias {
+  id        String    @id @default(uuid())
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  // householdId nullable allows future "global alias packs"
+  householdId     String?
+  canonicalItemId String
+
+  // ✅ Phase-2 naming (server.ts expects aliasText)
+  aliasText  String // as seen on receipts: "CHKN BRST", "Chx breast"
+  normalized String // normalized alias text for matching
+  confidence Int    @default(100) // deterministic system starts at 100
+
+  // optional vendor-specific aliasing
+  vendor String?
+  source String? // e.g. "receipt_import", "user", "support"
+
+  household     Household?    @relation(fields: [householdId], references: [id])
+  canonicalItem CanonicalItem @relation(fields: [canonicalItemId], references: [id])
+
+  // ✅ constraints + perf (LOCKED)
+  @@unique([canonicalItemId, aliasText])
+  // keep your household-specific alias uniqueness (useful for tenant overrides)
+  @@unique([householdId, normalized])
+  @@index([aliasText])
+  @@index([canonicalItemId])
+  @@index([householdId, normalized])
+}
+
+//
+// Receipt ingestion: raw -> lines -> normalized proposals -> review decisions
+//
+
+model ReceiptRaw {
+  id        String    @id @default(uuid())
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  householdId String
+
+  // ✅ Phase-2: vendor (LOCKED)
+  vendor String
+
+  // traceability (keep your existing external ref concept)
+  sourceType String? // "amazon", "costco", "manual"
+  sourceRef  String? // orderId, receiptId, email id, etc.
+  sourceHash String? // hash of key raw inputs
+
+  // raw payload
+  rawText String?
+  rawJson Json?
+
+  // keep if you use it today
+  currency     String?
+  purchaseDate DateTime?
+
+  // if you already have status enum, keep it
+  status ReceiptsStatus @default(RECEIVED)
+
+  household Household @relation(fields: [householdId], references: [id])
+
+  lines       ReceiptLineRaw[]
+  normalized  NormalizedLineItem[]
+  sourcedLots InventoryLot[]       @relation("LotSourceReceipt")
+
+  // ✅ indexes (LOCKED + perf)
+  @@index([householdId, createdAt])
+  @@index([vendor])
+  @@index([purchaseDate])
+  @@index([sourceHash])
+  @@index([status])
+}
+
+model ReceiptLineRaw {
+  id        String    @id @default(uuid())
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  receiptId  String
+  lineNumber Int
+
+  // raw truth
+  rawLineText String?
+
+  // parsed (still raw truth)
+  vendorSku   String?
+  barcode     String?
+  name        String?
+  description String?
+
+  // original for traceability
+  originalQuantity Decimal? @db.Decimal(12, 3)
+  originalUnit     String?
+  originalPrice    Decimal? @db.Decimal(12, 2)
+
+  // keep your existing pricing fields if used already
+  unitPrice Decimal? @db.Decimal(12, 2)
+  lineTotal Decimal? @db.Decimal(12, 2)
+
+  receipt ReceiptRaw @relation(fields: [receiptId], references: [id])
+
+  // 1:1 normalization row (recommended)
+  normalized NormalizedLineItem?
+
+  @@unique([receiptId, lineNumber])
+  @@index([receiptId])
+}
+
+model NormalizedLineItem {
+  id        String    @id @default(uuid())
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  householdId String
+  receiptId   String
+
+  // ✅ Phase-2: link to receiptLineRaw (server.ts expects receiptLineRawId)
+  receiptLineRawId String         @unique
+  receiptLineRaw   ReceiptLineRaw @relation(fields: [receiptLineRawId], references: [id])
+
+  // raw/normalized text
+  rawDescription String?
+  normalizedText String?
+
+  // ✅ Units standardization (LOCKED)
+  quantityGrams Decimal? @db.Decimal(12, 3)
+  quantityEach  Decimal? @db.Decimal(12, 3)
+
+  // original for traceability (LOCKED)
+  originalQuantity Decimal? @db.Decimal(12, 3)
+  originalUnit     String?
+
+  // keep your existing cost fields if you want
+  unitPrice Decimal? @db.Decimal(12, 2)
+  lineTotal Decimal? @db.Decimal(12, 2)
+
+  // ✅ matching proposal + review decision (keep your architecture)
+  proposedCanonicalItemId String?
+  finalCanonicalItemId    String?
+
+  proposedCanonicalItem CanonicalItem? @relation("ProposedCanonicalItem", fields: [proposedCanonicalItemId], references: [id])
+  finalCanonicalItem    CanonicalItem? @relation("FinalCanonicalItem", fields: [finalCanonicalItemId], references: [id])
+
+  // ✅ Phase-2 decisioning (LOCKED)
+  decisionStatus  DecisionStatus @default(PROPOSED)
+  matchMethod     MatchMethod?
+  confidenceScore Decimal?       @db.Decimal(5, 4)
+
+  // ✅ Versioning recommendations (LOCKED + extras)
+  modelVersion               String?
+  normalizationEngineVersion String? // e.g. "norm-v1"
+  evidence                   Json?
+  sourceHash                 String?
+
+  suggestedAt DateTime?
+  reviewedAt  DateTime?
+  finalizedAt DateTime?
+
+  decidedByType ActorType?
+  decidedById   String?
+
+  // existing relations (based on your old model)
+  household Household  @relation(fields: [householdId], references: [id])
+  receipt   ReceiptRaw @relation(fields: [receiptId], references: [id])
+
+  // if you had reviewer relation before:
+  reviewedByUserId String?
+  reviewedBy       User?   @relation("LineReviewer", fields: [reviewedByUserId], references: [id])
+
+  // if you had inventory lots relation before:
+  sourcedLots InventoryLot[] @relation("LotSourceNormalized")
+
+  // ✅ indexes (LOCKED + perf)
+  @@index([receiptLineRawId])
+  @@index([proposedCanonicalItemId])
+  @@index([finalCanonicalItemId])
+  @@index([decisionStatus])
+  @@index([finalCanonicalItemId, decisionStatus])
+  @@index([reviewedByUserId])
+  @@index([householdId, decisionStatus])
+  @@index([receiptId])
+}
+
+//
+// Inventory: lot-based tracking (expiry + cost + remaining)
+//
+
+model InventoryLot {
+  id              String @id @default(uuid())
+  householdId     String
+  canonicalItemId String
+
+  // provenance / traceability
+  sourceReceiptId        String?
+  sourceNormalizedLineId String?
+
+ // quantities (standardized by unitCode)
+  quantityInitial   Decimal @db.Decimal(12, 3)
+  quantityRemaining Decimal @db.Decimal(12, 3)
+
+  unitCode     String // normalized unit code
+  locationCode String? // "FRIDGE", "FREEZER", "PANTRY" (config-driven)
+  purchasedAt  DateTime  @default(now())
+  expiresAt    DateTime?
+
+  // cost attribution
+  currency     String? // "USD"
+  costTotal    Decimal?  @db.Decimal(12, 2)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+
+  // relations
+  household     Household     @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  canonicalItem CanonicalItem @relation(fields: [canonicalItemId], references: [id], onDelete: Restrict)
+
+  sourceReceipt    ReceiptRaw?         @relation("LotSourceReceipt", fields: [sourceReceiptId], references: [id], onDelete: SetNull)
+  sourceNormalized NormalizedLineItem? @relation("LotSourceNormalized", fields: [sourceNormalizedLineId], references: [id], onDelete: SetNull)
+
+
+  // performance indexes
+  @@index([householdId, expiresAt])
+  @@index([householdId, quantityRemaining])
+  @@index([householdId, locationCode])
+  @@index([householdId, canonicalItemId])
+  @@index([sourceReceiptId])
+
+    // idempotency: one lot per normalized line item
+  @@unique([sourceNormalizedLineId])
+
+}
+
+//
+// Optimization suggestions + explicit approval/rejection
+//
+
+model OptimizationSuggestion {
+  id          String               @id @default(uuid())
+  householdId String
+  type        OptimizationType
+  score       Int                  @default(0) // weighted score 0..100 (deterministic/scoring layer)
+  status      OptimizationDecision @default(PROPOSED)
+
+  // input/output kept as JSON to avoid premature rigid schemas
+  inputPayload  Json
+  outputPayload Json
+
+  proposedAt DateTime @default(now())
+
+  decidedByUserId String?
+  decidedAt       DateTime?
+
+  household Household @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  decidedBy User?     @relation("DecisionActor", fields: [decidedByUserId], references: [id])
+
+  @@index([householdId, proposedAt])
+  @@index([householdId, status])
+  @@index([type])
+}
+
+//
+// Append-only audit log (single source of truth for changes)
+//
+
+model InventoryEvent {
+  id          String             @id @default(uuid())
+  householdId String
+  type        InventoryEventType
+
+  actorUserId String?
+  entityType  String? // "RECEIPT", "LOT", "ALIAS", "SUGGESTION"
+  entityId    String?
+
+  requestId   String?  
+  payload     Json
+
+  createdAt DateTime @default(now())
+
+  household Household @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  actor     User?     @relation("EventActor", fields: [actorUserId], references: [id])
+
+  @@index([householdId, createdAt])
+  @@index([householdId, type])  
+  @@index([householdId, entityId])
+  //@@index([householdId, requestId])
+  @@index([householdId, type, createdAt])
+
+  // ✅ idempotency key: multiple nulls allowed in Postgres, so safe
+  @@unique([householdId, requestId])
+  
+}
+
+model AuditEvent {
+  id        String   @id @default(uuid())
+  createdAt DateTime @default(now())
+
+  actorType ActorType
+  actorId   String?
+
+  action      String // keep flexible; enforce in app layer
+  entityType  String
+  entityId    String
+  householdId String?
+
+  before Json?
+  after  Json?
+  reason String?
+
+  requestId     String?
+  correlationId String?
+
+  // security metadata
+  ip           String?
+  userAgent    String?
+  authProvider String?
+  jwtKid       String?
+
+  @@index([entityType, entityId])
+  @@index([actorId, createdAt])
+  @@index([createdAt])
+  @@index([correlationId])
+}

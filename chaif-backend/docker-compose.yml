@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: chaif-postgres
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: chaif
+    ports:
+      - "5433:5432"
+    volumes:
+      - chaif-data:/var/lib/postgresql/data
+
+volumes:
+  chaif-data:
