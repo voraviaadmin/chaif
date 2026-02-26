@@ -507,11 +507,13 @@ function parseReceiptTextDeterministic(
     //let logicalFixed = logical;
     let logicalFixed = splitMultiSkuLines(logical);
 
-    console.log("logicalFixed", logicalFixed);
+    console.log("logicalFixed BEFORE vendor", logicalFixed);
 
     if (adapter?.preprocessLogicalLines) {
         logicalFixed = adapter.preprocessLogicalLines(logicalFixed, { vendor });
     }
+
+    console.log("logicalFixed AFTER vendor", logicalFixed);
 
     // ----- Totals extraction (generic bottom scan) -----
     let total: number | null = null;
