@@ -19,17 +19,17 @@ export type ReceiptOcrProviderName = "google" | "openai" | "pdf" | "none";
 type OcrProvider = "google" | "openai" | "none";
 
 function resolveOcrProvider(): OcrProvider {
-  const raw = (process.env.RECEIPT_OCR_PROVIDER || "google").toLowerCase().trim();
+    const raw = (process.env.RECEIPT_OCR_PROVIDER || "google").toLowerCase().trim();
 
-  const allowed: OcrProvider[] = ["google", "openai", "none"];
+    const allowed: OcrProvider[] = ["google", "openai", "none"];
 
-  if (!allowed.includes(raw as OcrProvider)) {
-    throw new Error(
-      `[receiptOcr] Invalid RECEIPT_OCR_PROVIDER="${raw}". Allowed: ${allowed.join(", ")}`
-    );
-  }
+    if (!allowed.includes(raw as OcrProvider)) {
+        throw new Error(
+            `[receiptOcr] Invalid RECEIPT_OCR_PROVIDER="${raw}". Allowed: ${allowed.join(", ")}`
+        );
+    }
 
-  return raw as OcrProvider;
+    return raw as OcrProvider;
 }
 
 export type ReceiptOcrExtractResult = {
@@ -394,40 +394,40 @@ function parseReceiptTextDeterministic(
     // ----- Vendor detection (keep your existing logic) -----
     const headerLines = rawLines.slice(0, 25);
     const headerText = headerLines.join("\n");
-    
+
     const detectedAdapter = detectVendorAdapter({
         rawLines,
         headerText,
         fullText: text,
-      });
-      
-      let vendor: string | null = detectedAdapter?.id ?? null;
-      
-      if (!vendor) {
+    });
+
+    let vendor: string | null = detectedAdapter?.id ?? null;
+
+    if (!vendor) {
         // generic fallback: first meaningful header line (no retailer list)
         const ignore = ["welcome", "receipt", "thank you", "customer copy", "member", "orders & purchases"];
         for (let i = 0; i < Math.min(rawLines.length, 15); i++) {
-          const l = rawLines[i]?.trim();
-          if (!l) continue;
-          const low = l.toLowerCase();
-          if (ignore.some((w) => low.includes(w))) continue;
-      
-          const letters = (l.match(/[A-Za-z]/g) ?? []).length;
-          if (letters >= 3) {
-            vendor = l;
-            break;
-          }
-        }
-      }
+            const l = rawLines[i]?.trim();
+            if (!l) continue;
+            const low = l.toLowerCase();
+            if (ignore.some((w) => low.includes(w))) continue;
 
-      const purchaseDate = extractDate(text);
-      const currency = likelyCurrencyFromText(text);
-      
-      // Apply adapter hooks (do NOT redeclare another `adapter`)
-      const adapter = detectedAdapter;
-      if (adapter?.preprocessRawLines) {
+            const letters = (l.match(/[A-Za-z]/g) ?? []).length;
+            if (letters >= 3) {
+                vendor = l;
+                break;
+            }
+        }
+    }
+
+    const purchaseDate = extractDate(text);
+    const currency = likelyCurrencyFromText(text);
+
+    // Apply adapter hooks (do NOT redeclare another `adapter`)
+    const adapter = detectedAdapter;
+    if (adapter?.preprocessRawLines) {
         rawLines = adapter.preprocessRawLines(rawLines, { vendor });
-      }
+    }
 
     const raw2 = rawLines;
 
@@ -453,7 +453,7 @@ function parseReceiptTextDeterministic(
     // extra header noise (generic)
     const headerNoiseRe =
         /\b(orders\s*&\s*purchases|member|approved|purchase|instant\s+savings|thank\s*you|customer\s*copy|order\s*summary|order\s*details|delivered|your\s*package\s+was\s+left|sold\s+by|supplied\s+by|return\s+items?)\b/i;
-        
+
 
     const logical: string[] = [];
     let pendingParts: string[] = [];
@@ -475,14 +475,55 @@ function parseReceiptTextDeterministic(
             continue;
         }
 
-        const hasMoney = moneyAtEndRe.test(l) || !!l.match(moneyTokenRe);
+
+        const unitSlashPriceRe = /\/\s*-?\$?\d{1,7}(?:[.,]\d{2})-?\s*$/;     // "... /0.54" at end
+        const atForUnitPriceRe = /\bAT\b.*\bFOR\b.*-?\$?\d{1,7}(?:[.,]\d{2})\s*$/i; // "AT 1 FOR 0.25" at end
+
+        function hasLineTotalAtEnd(l: string): boolean {
+            const m = l.match(moneyAtEndRe);
+            if (!m) return false;
+
+            const amount = m[1];
+            const idx = l.lastIndexOf(amount);
+            const prevChar = idx > 0 ? l[idx - 1] : "";
+
+            // 1) exclude "/0.54" style unit price lines
+            if (prevChar === "/" || unitSlashPriceRe.test(l)) return false;
+
+            // 2) exclude "AT 1 FOR 0.25" style unit prices
+            if (atForUnitPriceRe.test(l)) return false;
+
+            return true;
+        }
+
+        //const hasMoney = moneyAtEndRe.test(l) || !!l.match(moneyTokenRe);
+        //const hasMoney = moneyAtEndRe.test(l);
+        const hasMoney = hasLineTotalAtEnd(l) || isPriceOnlyLine(l);
+
+        // Detect “weight math” lines that usually need a following extended-total line.
+        // Examples OCR emits:
+        //   "BANANAS 3.04 lb @ 0.54"
+        //   "000000004011 F 1.0 lb /0.54"
+        //   "1.95 lb @ 0.88"
+        const looksLikeWeightMathLine = (s: string) => {
+            const t = s.trim();
+            const hasWeightUnit = /\b(lb|lbs|oz|kg|g)\b/i.test(t);
+            const hasRateToken = /(@|\/)\s*\$?\d{1,6}(?:[.,]\d{2})\b/.test(t); // @0.54 or /0.54
+            return hasWeightUnit && hasRateToken;
+        };
 
         if (isPriceOnlyLine(l)) {
-            // price-only: attach to pending if exists; else keep as standalone (will be ignored later)
             if (pendingParts.length) {
+                // existing behavior: price-only closes a buffered wrap
                 pendingParts.push(l);
                 flushPending();
+            } else if (logical.length && looksLikeWeightMathLine(logical[logical.length - 1])) {
+                // NEW generic behavior: attach price-only to prior weight-math line
+                logical[logical.length - 1] = `${logical[logical.length - 1]} ${l}`
+                    .replace(/\s{2,}/g, " ")
+                    .trim();
             } else {
+                // keep as standalone (still useful for discounts or edge cases)
                 logical.push(l);
             }
             continue;
@@ -504,8 +545,47 @@ function parseReceiptTextDeterministic(
     }
     flushPending();
 
+
+    function mergeProduceTriples(lines: string[]) {
+        const out: string[] = [];
+
+        const qtyUnitPriceRe =
+            /\b\d+(?:\.\d+)?\s*(?:lb|lbs|kg|g|oz)\b.*\/\s*-?\$?\d{1,7}(?:[.,]\d{2})-?\s*$/i;
+
+        for (let i = 0; i < lines.length; i++) {
+            const a = lines[i]?.trim() ?? "";
+            const b = lines[i + 1]?.trim() ?? "";
+            const c = lines[i + 2]?.trim() ?? "";
+
+            // A = item name (no price at end)
+            // B = qty + unit price line (ends in /0.xx or similar)
+            // C = price-only total (e.g. 1.64)
+            if (
+                a &&
+                b &&
+                c &&
+                !moneyAtEndRe.test(a) &&
+                qtyUnitPriceRe.test(b) &&
+                isPriceOnlyLine(c)
+            ) {
+                out.push(`${a} ${b} ${c}`.replace(/\s{2,}/g, " ").trim());
+                i += 2;
+                continue;
+            }
+
+            out.push(a);
+        }
+
+        return out;
+    }
+
+
+    let logicalFixed2 = mergeProduceTriples(logical);
+    console.log("logicalFixed2", logicalFixed2);
+
+
     //let logicalFixed = logical;
-    let logicalFixed = splitMultiSkuLines(logical);
+    let logicalFixed = splitMultiSkuLines(logicalFixed2);
 
     console.log("logicalFixed BEFORE vendor", logicalFixed);
 
@@ -630,7 +710,7 @@ export async function extractReceipt(file: {
     fileName?: string;
 }): Promise<ReceiptOcrExtractResult> {
     //const providerRaw = String(env("RECEIPT_OCR_PROVIDER", "google") ?? "google");
-    const providerRaw  = process.env.RECEIPT_OCR_PROVIDER || "google";
+    const providerRaw = process.env.RECEIPT_OCR_PROVIDER || "google";
     const fallbackRaw = String(env("RECEIPT_OCR_FALLBACK", "openai") ?? "openai");
 
     console.log("[receiptOcr] providerRaw bytes:", Buffer.from(providerRaw).toString("hex"));
@@ -663,12 +743,12 @@ export async function extractReceipt(file: {
         // If user set *something* but it mapped to none, treat as invalid config.
         const raw = (v ?? "").toString().trim();
         if (raw.length > 0 && out === "none" && raw.toLowerCase() !== "none" && raw.toLowerCase() !== "off" && raw.toLowerCase() !== "disabled") {
-          throw new Error(
-            `[receiptOcr] Invalid ${envKey}="${raw}". Allowed: google|openai|pdf|none (aliases: gcp, vision, oai, off, disabled)`
-          );
+            throw new Error(
+                `[receiptOcr] Invalid ${envKey}="${raw}". Allowed: google|openai|pdf|none (aliases: gcp, vision, oai, off, disabled)`
+            );
         }
         return out;
-      };
+    };
 
     const provider = normalizeProviderStrict(providerRaw, "RECEIPT_OCR_PROVIDER");
     const fallback = normalizeProviderLoose(fallbackRaw); // fallback can safely disable itself
