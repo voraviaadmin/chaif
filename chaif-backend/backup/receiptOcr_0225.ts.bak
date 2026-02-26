@@ -8,7 +8,7 @@
 
 import vision from "@google-cloud/vision";
 import { tryExtractTextFromPdf, renderPdfToPngBuffers } from "./receiptPdf";
-import { detectVendorAdapter, getVendorAdapter } from "./vendorAdapters";
+import { getVendorAdapter } from "./vendorAdapters";
 
 //import * as pdfParse from "pdf-parse";
 
@@ -392,42 +392,51 @@ function parseReceiptTextDeterministic(
     });
 
     // ----- Vendor detection (keep your existing logic) -----
-    const headerLines = rawLines.slice(0, 25);
-    const headerText = headerLines.join("\n");
-    
-    const detectedAdapter = detectVendorAdapter({
-        rawLines,
-        headerText,
-        fullText: text,
-      });
-      
-      let vendor: string | null = detectedAdapter?.id ?? null;
-      
-      if (!vendor) {
-        // generic fallback: first meaningful header line (no retailer list)
+    const header = rawLines.slice(0, Math.min(25, rawLines.length));
+    const joinedHeader = header.join("\n").toLowerCase();
+
+    const preferredVendors = [
+        "costco",
+        "walmart",
+        "kroger",
+        "target",
+        "amazon",
+        "whole foods",
+        "heb",
+        "aldi",
+    ];
+
+    let vendor: string | null = null;
+    for (const pv of preferredVendors) {
+        if (joinedHeader.includes(pv)) {
+            vendor = pv === "heb" ? "H-E-B" : pv.replace(/\b\w/g, (c) => c.toUpperCase());
+            break;
+        }
+    }
+
+    if (!vendor) {
         const ignore = ["welcome", "receipt", "thank you", "customer copy", "member", "orders & purchases"];
         for (let i = 0; i < Math.min(rawLines.length, 15); i++) {
-          const l = rawLines[i]?.trim();
-          if (!l) continue;
-          const low = l.toLowerCase();
-          if (ignore.some((w) => low.includes(w))) continue;
-      
-          const letters = (l.match(/[A-Za-z]/g) ?? []).length;
-          if (letters >= 3) {
-            vendor = l;
-            break;
-          }
+            const l = rawLines[i];
+            const low = l.toLowerCase();
+            if (low.length < 2) continue;
+            if (ignore.some((w) => low.includes(w))) continue;
+            const letters = (l.match(/[A-Za-z]/g) ?? []).length;
+            if (letters >= 3) {
+                vendor = l;
+                break;
+            }
         }
-      }
+    }
 
-      const purchaseDate = extractDate(text);
-      const currency = likelyCurrencyFromText(text);
-      
-      // Apply adapter hooks (do NOT redeclare another `adapter`)
-      const adapter = detectedAdapter;
-      if (adapter?.preprocessRawLines) {
-        rawLines = adapter.preprocessRawLines(rawLines, { vendor });
-      }
+    const purchaseDate = extractDate(text);
+    const currency = likelyCurrencyFromText(text);
+
+    const adapter = getVendorAdapter(vendor);
+    if (adapter?.preprocessRawLines) {
+        //rawLines = adapter.preprocessRawLines(rawLines, { vendor });
+        rawLines = adapter?.preprocessRawLines ? adapter.preprocessRawLines(rawLines, { vendor }) : rawLines;
+    }
 
     const raw2 = rawLines;
 

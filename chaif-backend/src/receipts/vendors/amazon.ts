@@ -1,16 +1,20 @@
-import type { VendorAdapter } from "../vendorAdapters";
+// src/receipts/vendors/amazon.ts
+import type { ReceiptVendorAdapter } from "../vendorAdapters";
 
-export const amazonAdapter: VendorAdapter = {
-  key: "Amazon",
-  applies(vendor: string | null): boolean {
-    if (!vendor) return false;
-    return vendor.toLowerCase().includes("amazon");
+const amazonRe = /\bamazon\b/i;
+
+export const amazonAdapter: ReceiptVendorAdapter = {
+  id: "amazon",
+
+  detect: ({ headerText, fullText }) => {
+    if (amazonRe.test(headerText)) return 5;
+    if (amazonRe.test(fullText)) return 2;
+    return 0;
   },
 
   preprocessRawLines(lines: string[]): string[] {
     return lines.filter((l) => {
       const low = l.toLowerCase();
-
       if (
         low.includes("delivered") ||
         low.includes("return window") ||
@@ -27,7 +31,6 @@ export const amazonAdapter: VendorAdapter = {
       ) {
         return false;
       }
-
       return true;
     });
   },
@@ -35,7 +38,6 @@ export const amazonAdapter: VendorAdapter = {
   preprocessLogicalLines(lines: string[]): string[] {
     return lines.filter((l) => {
       const low = l.toLowerCase();
-
       if (
         low.startsWith("shipping") ||
         low.startsWith("free shipping") ||
@@ -44,7 +46,6 @@ export const amazonAdapter: VendorAdapter = {
       ) {
         return false;
       }
-
       return true;
     });
   },

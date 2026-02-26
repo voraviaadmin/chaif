@@ -7,6 +7,6 @@
       "strict": true,
       "skipLibCheck": true
     },
-    "include": ["src/**/*.ts", "src/**/*.d.ts", "src/receiptOcr_0223.ts.bak"]
+    "include": ["src/**/*.ts", "src/**/*.d.ts", "src/receiptOcr_0223.ts.bak", "src/receipts/vendorAdapters_0225.ts.bak", "src/receiptOcr_0225.ts.bak"]
   }
   

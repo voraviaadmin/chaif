@@ -1,0 +1,57 @@
+// src/receipts/vendorAdapters.ts
+import { costcoAdapter } from "./vendors/costco";
+import { amazonAdapter } from "./vendors/amazon";
+import { walmartAdapter } from "./vendors/walmart";
+
+export type ReceiptVendorKey = "Costco" | "Walmart" | "Kroger" | "Target" | "Amazon" | "Whole Foods" | "H-E-B" | string;
+
+export type LogicalLineContext = {
+  vendor: string | null;
+};
+
+export type VendorAdapter = {
+  key: string;
+  applies: (vendor: string | null) => boolean;
+  
+
+  // Optional hooks
+  preprocessRawLines?: (rawLines: string[], ctx: LogicalLineContext) => string[];
+  preprocessLogicalLines?: (logical: string[], ctx: LogicalLineContext) => string[];
+
+  // Optional post-processing
+  postprocessItems?: (items: ParsedLineItem[], ctx: LogicalLineContext) => ParsedLineItem[];
+};
+
+export type ParsedLineItem = {
+  rawLineText: string;
+  name: string;
+  description: string | null;
+  vendorSku: string | null;
+  barcode: string | null;
+  originalQuantity: number | null;
+  originalUnit: string | null;
+  unitPrice: number | null;
+  lineTotal: number | null;
+};
+
+const adapters: VendorAdapter[] = [
+  costcoAdapter,
+  amazonAdapter,
+  walmartAdapter,
+];
+
+export function getVendorAdapter(vendor: string | null | undefined): VendorAdapter | null {
+  if (!vendor) return null;
+  const v = vendor.toLowerCase();
+
+  if (v.includes("walmart") || v.includes("wal-mart") || v.includes("wal*mart")) return walmartAdapter;
+  if (v.includes("costco")) return costcoAdapter;
+  if (v.includes("amazon")) return amazonAdapter;
+
+  return null;
+}
+
+
+
+
+
