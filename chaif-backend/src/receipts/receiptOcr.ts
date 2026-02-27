@@ -77,19 +77,33 @@ function clamp01(n: number): number {
 
 function safeParseNumber(s: string): number | null {
     if (!s) return null;
-
+  
+    let raw = String(s).trim();
+  
+    // Handle parentheses negatives like "($3.00)"
+    let neg = false;
+    if (/^\(\s*.*\s*\)$/.test(raw)) {
+      neg = true;
+      raw = raw.replace(/^\(\s*/, "").replace(/\s*\)$/, "");
+    }
+  
+    // Normalize unicode minus to hyphen-minus
+    raw = raw.replace(/\u2212/g, "-");
+  
     // keep digits, dot, comma, minus
-    let cleaned = s.replace(/[^0-9.,\-]/g, "").replace(/,/g, "");
+    let cleaned = raw.replace(/[^0-9.,\-]/g, "").replace(/,/g, "");
     if (!cleaned) return null;
-
+  
     // handle trailing minus like "2.40-" => "-2.40"
     if (cleaned.endsWith("-") && !cleaned.startsWith("-")) {
-        cleaned = "-" + cleaned.slice(0, -1);
+      cleaned = "-" + cleaned.slice(0, -1);
     }
-
+  
     const n = Number(cleaned);
-    return Number.isFinite(n) ? n : null;
-}
+    if (!Number.isFinite(n)) return null;
+  
+    return neg ? -Math.abs(n) : n;
+  }
 
 function likelyCurrencyFromText(t: string): string | null {
     const up = t.toUpperCase();
@@ -201,9 +215,10 @@ function looksLikeReceiptText(s: string): boolean {
 type OcrMode = "auto" | "text" | "geo";
 
 function getOcrMode(): OcrMode {
-    const v = (process.env.RECEIPT_OCR_MODE || "auto").toLowerCase();
-    if (v === "auto" || v === "text" || v === "geo") return v;
-    return "auto";
+    // ✅ Default to GEO for images/PDF renders; fallback to text if geoText is absent.
+    const v = (process.env.RECEIPT_OCR_MODE || "geo").toLowerCase();
+    if (v === "auto" || v === "text" || v === "geo") return v as OcrMode;
+    return "geo";
 }
 
 function scoreReceiptText(text: string): number {
@@ -425,399 +440,396 @@ function splitMultiSkuLines(lines: string[]): string[] {
 
 function parseReceiptTextDeterministic(
     fullText: string
-): Omit<ReceiptOcrExtractResult, "provider"> {
+  ): Omit<ReceiptOcrExtractResult, "provider"> {
     const text = (fullText ?? "")
-        .replace(/\r/g, "\n")
-        .replace(/\u00A0/g, " ");
-    console.log("text", text);
-
-    // ----- Raw lines -----
+      .replace(/\r/g, "\n")
+      .replace(/\u00A0/g, " ")
+      .replace(/\u2212/g, "-"); // unicode minus → "-"
+  
+    // -----------------------
+    // Raw lines (basic cleanup)
+    // -----------------------
     let rawLines = text
-        .split("\n")
-        .map((s) => s.trim())
-        .filter((s) => s.length > 0);
-    console.log("rawLines", rawLines);
-
-    // drop URLs + page markers + non-alnum garbage early (generic)
+      .split("\n")
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+  
     rawLines = rawLines.filter((l) => {
-        const low = l.toLowerCase();
-        if (!/[A-Za-z0-9]/.test(l)) return false;
-        if (low.includes("http://") || low.includes("https://") || low.includes("www.")) return false;
-        if (/^\d+\s*\/\s*\d+$/.test(l.trim())) return false; // 1/2, 2/2
-        return true;
+      const low = l.toLowerCase();
+      if (!/[A-Za-z0-9]/.test(l)) return false;
+      if (low.includes("http://") || low.includes("https://") || low.includes("www.")) return false;
+      if (/^\d+\s*\/\s*\d+$/.test(l.trim())) return false; // 1/2, 2/2
+      return true;
     });
-
-    // ----- Vendor detection (keep your existing logic) -----
+  
+    // -----------------------
+    // Vendor detection (keep)
+    // -----------------------
     const header = rawLines.slice(0, Math.min(25, rawLines.length));
     const joinedHeader = header.join("\n").toLowerCase();
-
-    const preferredVendors = [
-        "costco",
-        "walmart",
-        "kroger",
-        "target",
-        "amazon",
-        "whole foods",
-        "heb",
-        "aldi",
-    ];
-
+  
+    const preferredVendors = ["costco", "walmart", "kroger", "target", "amazon", "whole foods", "heb", "aldi"];
     let vendor: string | null = null;
+  
     for (const pv of preferredVendors) {
-        if (joinedHeader.includes(pv)) {
-            vendor = pv === "heb" ? "H-E-B" : pv.replace(/\b\w/g, (c) => c.toUpperCase());
-            break;
-        }
+      if (joinedHeader.includes(pv)) {
+        vendor = pv === "heb" ? "H-E-B" : pv.replace(/\b\w/g, (c) => c.toUpperCase());
+        break;
+      }
     }
-
+  
     if (!vendor) {
-        const ignore = ["welcome", "receipt", "thank you", "customer copy", "member", "orders & purchases"];
-        for (let i = 0; i < Math.min(rawLines.length, 15); i++) {
-            const l = rawLines[i];
-            const low = l.toLowerCase();
-            if (low.length < 2) continue;
-            if (ignore.some((w) => low.includes(w))) continue;
-            const letters = (l.match(/[A-Za-z]/g) ?? []).length;
-            if (letters >= 3) {
-                vendor = l;
-                break;
-            }
+      const ignore = ["welcome", "receipt", "thank you", "customer copy", "member", "orders & purchases"];
+      for (let i = 0; i < Math.min(rawLines.length, 15); i++) {
+        const l = rawLines[i];
+        const low = l.toLowerCase();
+        if (low.length < 2) continue;
+        if (ignore.some((w) => low.includes(w))) continue;
+        const letters = (l.match(/[A-Za-z]/g) ?? []).length;
+        if (letters >= 3) {
+          vendor = l;
+          break;
         }
+      }
     }
-
+  
     const purchaseDate = extractDate(text);
     const currency = likelyCurrencyFromText(text);
-
+  
     const adapter = getVendorAdapter(vendor);
-    if (adapter?.preprocessRawLines) {
-        //rawLines = adapter.preprocessRawLines(rawLines, { vendor });
-        rawLines = adapter?.preprocessRawLines ? adapter.preprocessRawLines(rawLines, { vendor }) : rawLines;
-    }
-
-    const raw2 = rawLines;
-
-    // ----- Generic logical stitching -----
-    // Goal: produce lines where each item is "name + amount" when possible,
-    // while allowing multi-line name wrap + price-only lines.
-
-    const moneyTokenRe = /-?\$?\d{1,7}(?:[.,]\d{2})-?/g;
-    const moneyAtEndRe = /(-?\$?\d{1,7}(?:[.,]\d{2})-?)\s*(?:[A-Z]{1,2})?\s*$/i;
-
-
-
-    const isPriceOnlyLine = (l: string) => {
-        const trimmed = l.trim();
-        // allow trailing Y/N/E/F etc
-        return /^-?\$?\d{1,7}(?:[.,]\d{2})-?\s*[A-Z]{0,2}\s*$/.test(trimmed);
-    };
-
-
+    if (adapter?.preprocessRawLines) rawLines = adapter.preprocessRawLines(rawLines, { vendor });
+  
+    // -----------------------
+    // Regex + helpers
+    // -----------------------
     const totalsRe = /\b(subtotal|tax|total|amount due|balance due|change)\b/i;
     const tenderRe = /\b(visa|mastercard|amex|debit|credit)\b/i;
     const cashRe = /\bcash\b/i;
-    // extra header noise (generic)
+  
+    // header-ish noise (generic)
     const headerNoiseRe =
-        /\b(orders\s*&\s*purchases|member|approved|purchase|instant\s+savings|thank\s*you|customer\s*copy|order\s*summary|order\s*details|delivered|your\s*package\s+was\s+left|sold\s+by|supplied\s+by|return\s+items?)\b/i;
-
-
+      /\b(orders\s*&\s*purchases|member|approved|purchase|thank\s*you|customer\s*copy|order\s*summary|order\s*details|delivered|your\s*package\s+was\s+left|sold\s+by|supplied\s+by|return\s+items?)\b/i;
+  
+    // matches trailing money token + optional trailing minus + optional 1-3 letter flag
+    function extractTailAmountAndFlag(line: string): { prefix: string; amount: string; flag: string } | null {
+      const t = (line || "").trim();
+      // Example matches:
+      // "ONION ... 3.04" => prefix="ONION ...", amount="3.04"
+      // "351935 /847909 4.00-" => prefix="351935 /847909", amount="4.00-"
+      // "7.80-" => prefix="", amount="7.80-"
+      const m = t.match(/^(.*?)(-?\$?\d{1,7}(?:[.,]\d{2})-?)(?:\s+([A-Z]{1,3}))?\s*$/);
+      if (!m) return null;
+      return { prefix: (m[1] || "").trim(), amount: (m[2] || "").trim(), flag: (m[3] || "").trim() };
+    }
+  
+    function isPerUnitMoneyToken(line: string, tokenEndIndex: number): boolean {
+      const tail = line.slice(tokenEndIndex, tokenEndIndex + 14).toLowerCase();
+      return /^\s*\/\s*(lb|lbs|kg|g|oz|ea|ct|pc|pcs)\b/.test(tail);
+    }
+  
+    // return BOTH the value and the exact token boundaries used so we can remove the correct token from name
+    function pickLineTotalToken(line: string): { value: number; raw: string; start: number; end: number; perUnit: boolean } | null {
+      const re = /-?\$?\d{1,7}(?:[.,]\d{2})-?/g;
+      const hits: Array<{ value: number; raw: string; start: number; end: number; perUnit: boolean }> = [];
+  
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(line)) !== null) {
+        const raw = m[0];
+        const value = safeParseNumber(raw);
+        if (value === null) continue;
+        const start = m.index;
+        const end = m.index + raw.length;
+        const perUnit = isPerUnitMoneyToken(line, end);
+        hits.push({ value, raw, start, end, perUnit });
+      }
+      if (!hits.length) return null;
+  
+      // prefer last NON-per-unit
+      for (let i = hits.length - 1; i >= 0; i--) {
+        if (!hits[i].perUnit) return hits[i];
+      }
+      return hits[hits.length - 1];
+    }
+  
+    // recognize “discount ref rows” like "351935 /847909 4.00-"
+    function isDiscountRefRow(line: string): boolean {
+      const ex = extractTailAmountAndFlag(line);
+      if (!ex) return false;
+      const n = safeParseNumber(ex.amount);
+      if (n === null || n >= 0) return false;
+      // prefix contains no letters → looks like a reference row, not a product name
+      return ex.prefix.length > 0 && !/[A-Za-z]/.test(ex.prefix);
+    }
+  
+    // -----------------------
+    // Logical stitching (FIXED)
+    //
+    // Key change vs your current approach:
+    // - We DO NOT buffer arbitrary “no money” lines indefinitely.
+    // - We only attach “likely continuation” lines (SKU/flags/weights) to the immediately previous item.
+    // This prevents: first line being swallowed / dropped (HEB/F1).
+    // -----------------------
     const logical: string[] = [];
-    let pendingParts: string[] = [];
-
-    const flushPending = () => {
-        if (pendingParts.length) {
-            logical.push(pendingParts.join(" ").replace(/\s{2,}/g, " ").trim());
-            pendingParts = [];
-        }
+    let pending: string | null = null;
+  
+    const looksLikeSkuOrCode = (l: string) => /^\d{5,13}\b/.test(l) || /^([A-Z]{1,2})\b/.test(l);
+    const looksLikeWeightOrRate = (l: string) =>
+      /\b\d+(?:\.\d+)?\s*(lb|lbs|kg|g|oz)\b/i.test(l) ||
+      /@/.test(l) ||
+      /\/\s*(lb|lbs|kg|g|oz)\b/i.test(l);
+  
+    const flush = () => {
+      if (pending) {
+        logical.push(pending.replace(/\s{2,}/g, " ").trim());
+        pending = null;
+      }
     };
-
-    for (const l of rawLines) {
-        const low = l.toLowerCase();
-
-        // skip footer/tender lines in logical build (generic)
-        if (totalsRe.test(low) || tenderRe.test(low) || cashRe.test(low) || headerNoiseRe.test(low)) {
-            flushPending();
-            logical.push(l);
-            continue;
+  
+    for (const l0 of rawLines) {
+      const l = l0.trim();
+      const low = l.toLowerCase();
+  
+      // keep these as standalone separators
+      if (totalsRe.test(low) || tenderRe.test(low) || cashRe.test(low) || headerNoiseRe.test(low)) {
+        flush();
+        logical.push(l);
+        continue;
+      }
+  
+      // ✅ Always keep discount reference rows as standalone (we’ll normalize them in semantic repair)
+      if (isDiscountRefRow(l)) {
+        flush();
+        logical.push(l);
+        continue;
+      }
+  
+      // If line has a usable trailing total token, it’s a complete row → flush pending and push
+      const totalTok = pickLineTotalToken(l);
+      if (totalTok && !totalTok.perUnit) {
+        if (pending) {
+          // attach pending (name) + this priced row
+          logical.push(`${pending} ${l}`.replace(/\s{2,}/g, " ").trim());
+          pending = null;
+        } else {
+          logical.push(l);
         }
-
-        const hasMoney = moneyAtEndRe.test(l) || !!l.match(moneyTokenRe);
-
-        if (isPriceOnlyLine(l)) {
-            // price-only: attach to pending if exists; else keep as standalone (will be ignored later)
-            if (pendingParts.length) {
-                pendingParts.push(l);
-                flushPending();
-            } else {
-                logical.push(l);
-            }
-            continue;
+        continue;
+      }
+  
+      // If it’s a continuation line (SKU/weight/rate), attach to pending or last logical row
+      if (looksLikeSkuOrCode(l) || looksLikeWeightOrRate(l)) {
+        if (pending) {
+          pending = `${pending} ${l}`.replace(/\s{2,}/g, " ").trim();
+        } else if (logical.length) {
+          logical[logical.length - 1] = `${logical[logical.length - 1]} ${l}`.replace(/\s{2,}/g, " ").trim();
+        } else {
+          pending = l;
         }
-
-        if (hasMoney) {
-            // line with money closes any pending name wrap
-            if (pendingParts.length) {
-                pendingParts.push(l);
-                flushPending();
-            } else {
-                logical.push(l);
-            }
-            continue;
-        }
-
-        // no money: likely name wrap line → keep buffering
-        pendingParts.push(l);
+        continue;
+      }
+  
+      // Otherwise this is a “name-like” line.
+      // Start a new pending name; flush previous pending to avoid swallowing first item.
+      if (pending) flush();
+      pending = l;
     }
-    flushPending();
-
+    flush();
+  
     // -----------------------------
-    // Vendor-agnostic semantic repair
+    // Semantic repair (FIXED negatives)
     // -----------------------------
-
-    function isGarbageTokenLine(line: string): boolean {
-        const t = (line || "").trim();
-        if (!t) return true;
-        // Examples: "E E", "E  E", or a single slash.
-        if (/^\/+\s*$/.test(t)) return true;
-        if (/^([A-Z])(?:\s+\1)+$/.test(t)) return true;
-        return false;
-    }
-
-    function extractTailAmountAndFlag(
-        line: string
-    ): { prefix: string; amount: string; flag: string } | null {
-        const t = (line || "").trim();
-        // Capture a trailing money token with optional trailing minus and optional 1-3 letter flag.
-        // Examples:
-        //  - "1014484 CANTALOUPE 7.89 N" => prefix="1014484 CANTALOUPE", amount="7.89", flag="N"
-        //  - "5.69 N" => prefix="", amount="5.69", flag="N"
-        //  - "7.80-" => prefix="", amount="7.80-", flag=""
-        const m = t.match(/^(.*?)(-?\d{1,7}\.\d{2}-?)(?:\s+([A-Z]{1,3}))?\s*$/);
-        if (!m) return null;
-        return {
-            prefix: (m[1] || "").trim(),
-            amount: (m[2] || "").trim(),
-            flag: (m[3] || "").trim(),
-        };
-    }
-
-    function isMoneyOnlyOrMoneyFlag(line: string): boolean {
-        const ex = extractTailAmountAndFlag(line);
-        if (!ex) return false;
-        // "prefix" must be empty to be considered money-only.
-        return !ex.prefix;
-    }
-
     function semanticRepairLogicalLines(lines: string[]): string[] {
-        const input = (lines || []).map((l) => (l ?? "").trim()).filter(Boolean);
-        const out: string[] = [];
-
-        for (let i = 0; i < input.length; i++) {
-            const a = input[i];
-            const b = input[i + 1];
-            const c = input[i + 2];
-
-            // 1) Drop pure garbage tokens like "E E".
-            if (isGarbageTokenLine(a)) continue;
-
-            // 2) Standalone discount lines (e.g. "7.80-")
-            // Make them parseable by giving them a name.
-            if (isMoneyOnlyOrMoneyFlag(a)) {
-                const ex = extractTailAmountAndFlag(a);
-                const n = ex ? safeParseNumber(ex.amount) : null;
-                // Only treat as discount if negative.
-                if (n !== null && n < 0) {
-                    out.push(`DISCOUNT ${ex!.amount}`.trim());
-                    continue;
-                }
+      const input = (lines || []).map((x) => (x ?? "").trim()).filter(Boolean);
+      const out: string[] = [];
+  
+      for (let i = 0; i < input.length; i++) {
+        const a = input[i];
+  
+        // Drop garbage token lines like "E E"
+        if (/^([A-Z])(?:\s+\1)+$/.test(a.trim())) continue;
+  
+        // ✅ 1) Standalone negative lines like "7.80-"
+        const ex = extractTailAmountAndFlag(a);
+        if (ex) {
+          const n = safeParseNumber(ex.amount);
+          if (n !== null && n < 0) {
+            // If it’s money-only, name it DISCOUNT
+            if (!ex.prefix) {
+              out.push(`DISCOUNT ${ex.amount}`.trim());
+              continue;
             }
-
-            // 3) Pending item + price-shift swap.
-            // Pattern:
-            //   A: item row without amount (e.g. "1920277 FIESTA DIP")
-            //   B: item row with amount (e.g. "1014484 CANTALOUPE 7.89 N")
-            //   C: amount-only row (e.g. "5.69 N")
-            // We assume B's amount belongs to A, and C's amount belongs to B.
-            if (a && b && c) {
-                const bTail = extractTailAmountAndFlag(b);
-                const cTail = extractTailAmountAndFlag(c);
-
-                const bHasAmount = !!(bTail && bTail.amount && bTail.prefix);
-                const cIsAmountOnly = !!(cTail && cTail.amount && !cTail.prefix);
-
-                // A should not already have a trailing amount.
-                const aTail = extractTailAmountAndFlag(a);
-                const aHasAmount = !!(aTail && aTail.amount && aTail.prefix);
-
-                if (!aHasAmount && bHasAmount && cIsAmountOnly) {
-                    // A must look like an item row (letters/digits), not a header.
-                    if (/^[A-Z0-9]/i.test(a)) {
-                        const aRepaired = `${a} ${bTail!.amount}`.replace(/\s{2,}/g, " ").trim();
-                        const bRepaired = `${bTail!.prefix} ${cTail!.amount}${bTail!.flag ? " " + bTail!.flag : ""}`
-                            .replace(/\s{2,}/g, " ")
-                            .trim();
-                        out.push(aRepaired);
-                        out.push(bRepaired);
-                        i += 2; // consume A, B, C
-                        continue;
-                    }
-                }
+            // ✅ 2) Discount reference row: "351935 /847909 4.00-"
+            // Prefix has no letters → treat as discount, preserve reference for audit trail
+            if (!/[A-Za-z]/.test(ex.prefix)) {
+              out.push(`DISCOUNT ${ex.prefix} ${ex.amount}`.replace(/\s{2,}/g, " ").trim());
+              continue;
             }
-
-            out.push(a);
+          }
         }
-
-        return out;
+  
+        out.push(a);
+      }
+  
+      return out;
     }
-
+  
     let logicalFixed = splitMultiSkuLines(logical);
-
-    if (adapter?.preprocessLogicalLines) {
-        logicalFixed = adapter.preprocessLogicalLines(logicalFixed, { vendor });
-    }
-
-    // ✅ Produce merge (vendor-agnostic, before semantic repair + parse)
+    if (adapter?.preprocessLogicalLines) logicalFixed = adapter.preprocessLogicalLines(logicalFixed, { vendor });
+  
+    // Produce merge (your module)
     const produceMerge = mergeProduceLines(logicalFixed);
     logicalFixed = produceMerge.lines;
     const produceMergedIdx = new Set<number>(produceMerge.mergedLineIndexes);
-
-    // Vendor-agnostic semantic repair
+  
     logicalFixed = semanticRepairLogicalLines(logicalFixed);
-
-    console.log("logicalFixed", logicalFixed);
-
-
-    // ----- Totals extraction (generic bottom scan) -----
+  
+    // -----------------------
+    // Totals extraction (bottom scan)
+    // -----------------------
+    const moneyTokenRe = /-?\$?\d{1,7}(?:[.,]\d{2})-?/g;
+  
     let total: number | null = null;
     let tax: number | null = null;
-
+  
     const bottom = logicalFixed.slice(Math.max(0, logicalFixed.length - 60));
     for (let i = bottom.length - 1; i >= 0; i--) {
-        const l = bottom[i];
-        const low = l.toLowerCase();
-
-        if (tax === null && /\btax\b/i.test(low)) {
-            const all = l.match(moneyTokenRe);
-            if (all?.length) tax = safeParseNumber(all[all.length - 1]) ?? tax;
+      const l = bottom[i];
+      const low = l.toLowerCase();
+  
+      if (tax === null && /\btax\b/i.test(low)) {
+        const all = l.match(moneyTokenRe);
+        if (all?.length) tax = safeParseNumber(all[all.length - 1]) ?? tax;
+      }
+  
+      if (total === null && /\b(total|amount due|balance due)\b/i.test(low)) {
+        const all = l.match(moneyTokenRe);
+        if (all?.length) {
+          total = safeParseNumber(all[all.length - 1]) ?? total;
+          if (total !== null) break;
         }
-
-        if (total === null && /\b(total|amount due|balance due)\b/i.test(low)) {
-            const all = l.match(moneyTokenRe);
-            if (all?.length) {
-                total = safeParseNumber(all[all.length - 1]) ?? total;
-                if (total !== null) break;
-            }
-        }
+      }
     }
-
-    // ----- Item extraction (generic) -----
+  
+    // -----------------------
+    // Item extraction
+    // -----------------------
     const unitRe = /\b(oz|lb|lbs|g|kg|ml|l|ct|pk|pack|each)\b/i;
     const normalizeUnit = (u: string) => {
-        const low = u.toLowerCase();
-        if (low === "lbs") return "lb";
-        if (low === "ct") return "each";
-        if (low === "pk") return "pack";
-        return low;
+      const low = u.toLowerCase();
+      if (low === "lbs") return "lb";
+      if (low === "ct") return "each";
+      if (low === "pk") return "pack";
+      return low;
     };
-
-    const startsWithSkuRe = /^\d{5,8}\b/;
-
+  
+    const discountHintRe = /\b(discount|savings|coupon|promo|instant\s+savings)\b/i;
+  
     const items: any[] = [];
     let pricedLineCount = 0;
-
+  
     for (let li = 0; li < logicalFixed.length; li++) {
-        const l = logicalFixed[li];
-        const low = l.toLowerCase();
-        if (totalsRe.test(low) || tenderRe.test(low) || cashRe.test(low)) continue;
-
+      const l = logicalFixed[li];
+      const low = l.toLowerCase();
+      if (totalsRe.test(low) || tenderRe.test(low) || cashRe.test(low)) continue;
+  
+      const totalTok = pickLineTotalToken(l);
+      const lineTotal = totalTok ? totalTok.value : null;
+  
+      const isDiscountish = discountHintRe.test(l) || /^discount\b/i.test(l);
+  
+      if (lineTotal === null) {
+        if (!isDiscountish) continue;
+      }
+  
+      pricedLineCount++;
+  
+      const produce = detectProduce(l, {
+        tolerance: Number(env("RECEIPT_PRODUCE_TOLERANCE", "0.02")),
+      });
+  
+      // ✅ remove the EXACT token we used for lineTotal (not always the last token)
+      let noPrice = l.trim();
+      if (totalTok) {
+        noPrice = (noPrice.slice(0, totalTok.start) + noPrice.slice(totalTok.end)).trim();
+      } else {
+        // fallback: remove last money token
         const allMoney = l.match(moneyTokenRe);
-        const lineTotal = allMoney?.length ? safeParseNumber(allMoney[allMoney.length - 1]) : null;
-        if (lineTotal === null) continue; // items must have money at this stage
-
-        pricedLineCount++;
-
-        // ✅ Detect produce (uses the full line; vendor-agnostic)
-        const produce = detectProduce(l, {
-            tolerance: Number(env("RECEIPT_PRODUCE_TOLERANCE", "0.02")),
-        });
-
-        // remove the last money token (rightmost) for generic naming
-        let noPrice = l.trim();
-        const lastToken = allMoney![allMoney!.length - 1];
-        const idx = noPrice.lastIndexOf(lastToken);
-        if (idx >= 0) noPrice = (noPrice.slice(0, idx) + noPrice.slice(idx + lastToken.length)).trim();
-        noPrice = noPrice.replace(/\s*(?:[A-Z]{1,2})\s*$/i, "").trim(); // remove trailing Y/N/etc markers
-
-        // If produce, prefer detector's cleaned namePart (more accurate than generic chop)
-        const noPricePreferred = produce?.namePart ? produce.namePart : noPrice;
-
-        // Extract vendorSku if present at beginning; else null (generic)
-        const skuMatch = noPricePreferred.match(/^(\d{5,8})\b\s*(.*)$/);
-        const vendorSku = skuMatch ? skuMatch[1] : null;
-        const nameRaw = (skuMatch ? (skuMatch[2] ?? "") : noPricePreferred).trim();
-        const name = nameRaw.replace(/\s{2,}/g, " ").trim();
-        if (!name) continue;
-
-        let originalQuantity: number | null = 1;
-        let originalUnit: string | null = null;
-
-        // ✅ Produce-aware unitPrice + optional weight/unit capture (no schema break yet)
-        let unitPrice: number | null = produce?.unitPrice ?? lineTotal;
-
-        const unitMatch = name.match(unitRe);
-        if (unitMatch?.[1]) originalUnit = normalizeUnit(unitMatch[1]);
-
-        items.push({
-            rawLineText: l,
-            name,
-            description: null,
-            vendorSku,
-            barcode: null,
-            originalQuantity,
-            originalUnit,
-            unitPrice,
-            lineTotal,
-
-            // ✅ OPTIONAL: safe to include even before DB schema changes,
-            // as long as your later pipeline tolerates extra fields.
-            // If you want to delay persistence, keep these in-memory only for now.
-            weight: produce?.weight ?? null,
-            unit: produce?.unit ?? null,
-            produceMeta: produce
-                ? {
-                    confidenceScore: produce.confidenceScore,
-                    reason: produce.reason,
-                    mathValidated: produce.mathValidated,
-                    mergeApplied: produceMergedIdx.has(li),
-                }
-                : null,
-        });
+        if (allMoney?.length) {
+          const lastToken = allMoney[allMoney.length - 1];
+          const idx = noPrice.lastIndexOf(lastToken);
+          if (idx >= 0) noPrice = (noPrice.slice(0, idx) + noPrice.slice(idx + lastToken.length)).trim();
+        }
+      }
+  
+      noPrice = noPrice.replace(/\s*(?:[A-Z]{1,2})\s*$/i, "").trim(); // remove trailing Y/N/etc markers
+      const noPricePreferred = produce?.namePart ? produce.namePart : noPrice;
+  
+      const skuMatch = noPricePreferred.match(/^(\d{5,8})\b\s*(.*)$/);
+      const vendorSku = skuMatch ? skuMatch[1] : null;
+      const nameRaw = (skuMatch ? (skuMatch[2] ?? "") : noPricePreferred).trim();
+      let name = nameRaw.replace(/\s{2,}/g, " ").trim();
+  
+      // ✅ ensure discount rows don’t get dropped by empty name
+      if (!name && /^discount\b/i.test(l)) name = "DISCOUNT";
+      if (!name) continue;
+  
+      let originalQuantity: number | null = 1;
+      let originalUnit: string | null = null;
+  
+      const unitMatch = name.match(unitRe);
+      if (unitMatch?.[1]) originalUnit = normalizeUnit(unitMatch[1]);
+  
+      // Produce-aware unit price
+      const unitPrice: number | null = produce?.unitPrice ?? lineTotal;
+  
+      items.push({
+        rawLineText: l,
+        name,
+        description: null,
+        vendorSku,
+        barcode: null,
+        originalQuantity,
+        originalUnit,
+        unitPrice,
+        lineTotal,
+        weight: produce?.weight ?? null,
+        unit: produce?.unit ?? null,
+        produceMeta: produce
+          ? {
+              confidenceScore: produce.confidenceScore,
+              reason: produce.reason,
+              mathValidated: produce.mathValidated,
+              mergeApplied: produceMergedIdx.has(li),
+            }
+          : null,
+      });
     }
-
+  
     const finalItems = adapter?.postprocessItems ? adapter.postprocessItems(items, { vendor }) : items;
-
+  
     const confidence = scoreConfidence({
-        hasVendor: !!vendor,
-        hasDate: !!purchaseDate,
-        hasTotal: total !== null,
-        lineCount: finalItems.length,
-        pricedLineCount,
+      hasVendor: !!vendor,
+      hasDate: !!purchaseDate,
+      hasTotal: total !== null,
+      lineCount: finalItems.length,
+      pricedLineCount,
     });
-
+  
     const minConf = Number(env("RECEIPT_OCR_MIN_CONFIDENCE", "0.85"));
     const needsReview =
-        confidence < (Number.isFinite(minConf) ? minConf : 0.85) ||
-        finalItems.length < 3 ||
-        total === null;
-
+      confidence < (Number.isFinite(minConf) ? minConf : 0.85) ||
+      finalItems.length < 3 ||
+      total === null;
+  
     return {
-        receipt: { vendor, purchaseDate, currency, total, tax },
-        lines: finalItems,
-        confidence,
-        needsReview,
-        rawText: fullText ?? null,
-        rawJson: null,
+      receipt: { vendor, purchaseDate, currency, total, tax },
+      lines: finalItems,
+      confidence,
+      needsReview,
+      rawText: fullText ?? null,
+      rawJson: null,
     };
-}
+  }
 
 
 export async function extractReceipt(file: {

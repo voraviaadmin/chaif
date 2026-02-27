@@ -33,6 +33,61 @@ type LineBucket = {
   words: Array<{ x: number; text: string }>;
 };
 
+export type GeoLineObj = {
+  y: number;
+  tokens: Array<{ x: number; text: string }>;
+  text: string;
+};
+
+export function buildGeoLineObjects(wordsOrFullTextAnnotation: GeoWord[] | any, opts: GeoLineBuildOptions = {}): GeoLineObj[] {
+  const yMergeMultiplier = opts.yMergeMultiplier ?? 0.65;
+  const minWordLen = opts.minWordLen ?? 1;
+  const normalizeWhitespace = opts.normalizeWhitespace ?? true;
+
+  const words: GeoWord[] = Array.isArray(wordsOrFullTextAnnotation)
+    ? wordsOrFullTextAnnotation
+    : extractGeoWords(wordsOrFullTextAnnotation);
+
+  const filtered = words.filter((w) => (w.text || "").length >= minWordLen);
+
+  const enriched = filtered.map((w) => {
+    const m = bboxToMetrics(w.bbox);
+    return { ...w, _minX: m.minX, _cy: m.cy, _h: m.h };
+  });
+
+  const medH = median(enriched.map((e) => e._h).filter((h) => h > 0)) || 10;
+  const yThresh = Math.max(3, medH * yMergeMultiplier);
+
+  enriched.sort((a, b) => (a._cy - b._cy) || (a._minX - b._minX));
+
+  const lines: Array<{ y: number; words: Array<{ x: number; text: string }> }> = [];
+
+  for (const w of enriched) {
+    let bestIdx = -1;
+    let bestDist = Infinity;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const dist = Math.abs(lines[i].y - w._cy);
+      if (dist < bestDist) { bestDist = dist; bestIdx = i; }
+      if (lines[i].y < w._cy - (yThresh * 2)) break;
+    }
+
+    if (bestIdx >= 0 && bestDist <= yThresh) {
+      const L = lines[bestIdx];
+      L.y = (L.y + w._cy) / 2;
+      L.words.push({ x: w._minX, text: w.text });
+    } else {
+      lines.push({ y: w._cy, words: [{ x: w._minX, text: w.text }] });
+    }
+  }
+
+  return lines.map((L) => {
+    L.words.sort((a, b) => a.x - b.x);
+    const s = L.words.map((w) => w.text).join(" ");
+    const text = normalizeWhitespace ? normalizeLine(s) : s;
+    return { y: L.y, tokens: L.words, text };
+  }).filter((x) => x.text);
+}
+
 function clampNumber(n: any, fallback = 0): number {
   const v = typeof n === "number" ? n : Number(n);
   return Number.isFinite(v) ? v : fallback;
@@ -110,62 +165,5 @@ export function extractGeoWords(fullTextAnnotation: any): GeoWord[] {
  * Accepts either GeoWord[] (already extracted) or a Vision fullTextAnnotation object.
  */
 export function buildGeoLines(wordsOrFullTextAnnotation: GeoWord[] | any, opts: GeoLineBuildOptions = {}): string[] {
-  const yMergeMultiplier = opts.yMergeMultiplier ?? 0.65;
-  const minWordLen = opts.minWordLen ?? 1;
-  const normalizeWhitespace = opts.normalizeWhitespace ?? true;
-
-  //  const filtered = words.filter((w) => (w.text || "").length >= minWordLen);
-  const words: GeoWord[] = Array.isArray(wordsOrFullTextAnnotation)
-    ? wordsOrFullTextAnnotation
-    : extractGeoWords(wordsOrFullTextAnnotation);
-
-  const filtered = words.filter((w) => (w.text || "").length >= minWordLen);
-
-  // Sort by y then x
-  const enriched = filtered.map((w) => {
-    const m = bboxToMetrics(w.bbox);
-    return { ...w, _minX: m.minX, _cy: m.cy, _h: m.h };
-  });
-
-  const medH = median(enriched.map((e) => e._h).filter((h) => h > 0)) || 10;
-  const yThresh = Math.max(3, medH * yMergeMultiplier);
-
-  enriched.sort((a, b) => (a._cy - b._cy) || (a._minX - b._minX));
-
-  const lines: LineBucket[] = [];
-
-  for (const w of enriched) {
-    // Find best matching line bucket (closest y)
-    let bestIdx = -1;
-    let bestDist = Infinity;
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const dist = Math.abs(lines[i].y - w._cy);
-      if (dist < bestDist) {
-        bestDist = dist;
-        bestIdx = i;
-      }
-      // early exit: y grows as we iterate; once dist is > threshold and line is far above, stop
-      if (lines[i].y < w._cy - (yThresh * 2)) break;
-    }
-
-    if (bestIdx >= 0 && bestDist <= yThresh) {
-      const L = lines[bestIdx];
-      // update running average y (simple)
-      L.y = (L.y + w._cy) / 2;
-      L.words.push({ x: w._minX, text: w.text });
-    } else {
-      lines.push({ y: w._cy, words: [{ x: w._minX, text: w.text }] });
-    }
-  }
-
-  // Compose line strings
-  const out: string[] = [];
-  for (const L of lines) {
-    L.words.sort((a, b) => a.x - b.x);
-    const s = L.words.map((w) => w.text).join(" ");
-    out.push(normalizeWhitespace ? normalizeLine(s) : s);
-  }
-
-  // Drop empty
-  return out.filter(Boolean);
+  return buildGeoLineObjects(wordsOrFullTextAnnotation, opts).map((o) => o.text);
 }
