@@ -8,10 +8,7 @@
 
 import vision from "@google-cloud/vision";
 import { tryExtractTextFromPdf, renderPdfToPngBuffers } from "./receiptPdf";
-import { getVendorAdapter } from "./vendorAdapters";
-import { buildGeoLines } from "./geoLines";
-import { mergeProduceLines } from "./produce/produceMerge";
-import { detectProduce } from "./produce/produceDetector";
+import { detectVendorAdapter, getVendorAdapter } from "./vendorAdapters";
 
 //import * as pdfParse from "pdf-parse";
 
@@ -198,69 +195,16 @@ function looksLikeReceiptText(s: string): boolean {
     return hasMoney && hasSomeLines;
 }
 
-type OcrMode = "auto" | "text" | "geo";
-
-function getOcrMode(): OcrMode {
-    const v = (process.env.RECEIPT_OCR_MODE || "auto").toLowerCase();
-    if (v === "auto" || v === "text" || v === "geo") return v;
-    return "auto";
-}
-
-function scoreReceiptText(text: string): number {
-    // Heuristic scoring for mode selection (text vs geo-lines).
-    // Rewards: money values, totals markers, UPC/SKU patterns.
-    // Penalizes: URLs and extremely low structure.
-    const t = (text || "").replace(/\r/g, "");
-    if (!t.trim()) return -1e9;
-
-    const lines = t
-        .split(/\n+/)
-        .map((l) => l.trim())
-        .filter(Boolean);
-
-    const moneyHits = (t.match(/\b\d{1,7}[.,]\d{2}\b/g) || []).length;
-    const upcHits = (t.match(/\b\d{11,14}\b/g) || []).length;
-    const skuHits = (t.match(/\b\d{4,7}\b/g) || []).length;
-    const totalsHits = (t.match(/\b(subtotal|total|tax|change\s+due)\b/gi) || []).length;
-    const urlHits = (t.match(/https?:\/\//gi) || []).length;
-    const structure = Math.min(lines.length, 120);
-
-    return moneyHits * 6 + upcHits * 4 + skuHits * 2 + totalsHits * 8 + structure * 0.5 - urlHits * 10;
-}
-
-function chooseOcrText(opts: {
-    text: string;
-    geoText?: string;
-    mode: OcrMode;
-}): { chosenText: string; chosenMode: "text" | "geo"; scores: { text: number; geo: number } } {
-    const scoreText = scoreReceiptText(opts.text);
-    const scoreGeo = opts.geoText ? scoreReceiptText(opts.geoText) : -1e9;
-
-    if (opts.mode === "geo" && opts.geoText) {
-        return { chosenText: opts.geoText, chosenMode: "geo", scores: { text: scoreText, geo: scoreGeo } };
-    }
-    if (opts.mode === "text") {
-        return { chosenText: opts.text, chosenMode: "text", scores: { text: scoreText, geo: scoreGeo } };
-    }
-
-    // auto: require a margin so we don't destabilize known-good vendors.
-    if (opts.geoText && scoreGeo > scoreText + 5) {
-        return { chosenText: opts.geoText, chosenMode: "geo", scores: { text: scoreText, geo: scoreGeo } };
-    }
-    return { chosenText: opts.text, chosenMode: "text", scores: { text: scoreText, geo: scoreGeo } };
-}
-
 //const pdfParse = require("pdf-parse");
 
 
 
 // ✅ Google Vision (SDK + ADC)
-async function googleVisionDocument(buffer: Buffer): Promise<{ text: string; fullTextAnnotation?: any }> {
-    const [result] = await visionClient.documentTextDetection({ image: { content: buffer } });
-    return {
-        text: result.fullTextAnnotation?.text ?? "",
-        fullTextAnnotation: result.fullTextAnnotation,
-    };
+async function googleVisionDocumentText(buffer: Buffer): Promise<string> {
+    const [result] = await visionClient.documentTextDetection({
+        image: { content: buffer },
+    });
+    return result.fullTextAnnotation?.text ?? "";
 }
 
 // ✅ Robust JSON extraction from OpenAI (handles fenced JSON / extra text)
@@ -448,35 +392,26 @@ function parseReceiptTextDeterministic(
     });
 
     // ----- Vendor detection (keep your existing logic) -----
-    const header = rawLines.slice(0, Math.min(25, rawLines.length));
-    const joinedHeader = header.join("\n").toLowerCase();
+    const headerLines = rawLines.slice(0, 25);
+    const headerText = headerLines.join("\n");
 
-    const preferredVendors = [
-        "costco",
-        "walmart",
-        "kroger",
-        "target",
-        "amazon",
-        "whole foods",
-        "heb",
-        "aldi",
-    ];
+    const detectedAdapter = detectVendorAdapter({
+        rawLines,
+        headerText,
+        fullText: text,
+    });
 
-    let vendor: string | null = null;
-    for (const pv of preferredVendors) {
-        if (joinedHeader.includes(pv)) {
-            vendor = pv === "heb" ? "H-E-B" : pv.replace(/\b\w/g, (c) => c.toUpperCase());
-            break;
-        }
-    }
+    let vendor: string | null = detectedAdapter?.id ?? null;
 
     if (!vendor) {
+        // generic fallback: first meaningful header line (no retailer list)
         const ignore = ["welcome", "receipt", "thank you", "customer copy", "member", "orders & purchases"];
         for (let i = 0; i < Math.min(rawLines.length, 15); i++) {
-            const l = rawLines[i];
+            const l = rawLines[i]?.trim();
+            if (!l) continue;
             const low = l.toLowerCase();
-            if (low.length < 2) continue;
             if (ignore.some((w) => low.includes(w))) continue;
+
             const letters = (l.match(/[A-Za-z]/g) ?? []).length;
             if (letters >= 3) {
                 vendor = l;
@@ -488,10 +423,10 @@ function parseReceiptTextDeterministic(
     const purchaseDate = extractDate(text);
     const currency = likelyCurrencyFromText(text);
 
-    const adapter = getVendorAdapter(vendor);
+    // Apply adapter hooks (do NOT redeclare another `adapter`)
+    const adapter = detectedAdapter;
     if (adapter?.preprocessRawLines) {
-        //rawLines = adapter.preprocessRawLines(rawLines, { vendor });
-        rawLines = adapter?.preprocessRawLines ? adapter.preprocessRawLines(rawLines, { vendor }) : rawLines;
+        rawLines = adapter.preprocessRawLines(rawLines, { vendor });
     }
 
     const raw2 = rawLines;
@@ -540,14 +475,55 @@ function parseReceiptTextDeterministic(
             continue;
         }
 
-        const hasMoney = moneyAtEndRe.test(l) || !!l.match(moneyTokenRe);
+
+        const unitSlashPriceRe = /\/\s*-?\$?\d{1,7}(?:[.,]\d{2})-?\s*$/;     // "... /0.54" at end
+        const atForUnitPriceRe = /\bAT\b.*\bFOR\b.*-?\$?\d{1,7}(?:[.,]\d{2})\s*$/i; // "AT 1 FOR 0.25" at end
+
+        function hasLineTotalAtEnd(l: string): boolean {
+            const m = l.match(moneyAtEndRe);
+            if (!m) return false;
+
+            const amount = m[1];
+            const idx = l.lastIndexOf(amount);
+            const prevChar = idx > 0 ? l[idx - 1] : "";
+
+            // 1) exclude "/0.54" style unit price lines
+            if (prevChar === "/" || unitSlashPriceRe.test(l)) return false;
+
+            // 2) exclude "AT 1 FOR 0.25" style unit prices
+            if (atForUnitPriceRe.test(l)) return false;
+
+            return true;
+        }
+
+        //const hasMoney = moneyAtEndRe.test(l) || !!l.match(moneyTokenRe);
+        //const hasMoney = moneyAtEndRe.test(l);
+        const hasMoney = hasLineTotalAtEnd(l) || isPriceOnlyLine(l);
+
+        // Detect “weight math” lines that usually need a following extended-total line.
+        // Examples OCR emits:
+        //   "BANANAS 3.04 lb @ 0.54"
+        //   "000000004011 F 1.0 lb /0.54"
+        //   "1.95 lb @ 0.88"
+        const looksLikeWeightMathLine = (s: string) => {
+            const t = s.trim();
+            const hasWeightUnit = /\b(lb|lbs|oz|kg|g)\b/i.test(t);
+            const hasRateToken = /(@|\/)\s*\$?\d{1,6}(?:[.,]\d{2})\b/.test(t); // @0.54 or /0.54
+            return hasWeightUnit && hasRateToken;
+        };
 
         if (isPriceOnlyLine(l)) {
-            // price-only: attach to pending if exists; else keep as standalone (will be ignored later)
             if (pendingParts.length) {
+                // existing behavior: price-only closes a buffered wrap
                 pendingParts.push(l);
                 flushPending();
+            } else if (logical.length && looksLikeWeightMathLine(logical[logical.length - 1])) {
+                // NEW generic behavior: attach price-only to prior weight-math line
+                logical[logical.length - 1] = `${logical[logical.length - 1]} ${l}`
+                    .replace(/\s{2,}/g, " ")
+                    .trim();
             } else {
+                // keep as standalone (still useful for discounts or edge cases)
                 logical.push(l);
             }
             continue;
@@ -569,98 +545,32 @@ function parseReceiptTextDeterministic(
     }
     flushPending();
 
-    // -----------------------------
-    // Vendor-agnostic semantic repair
-    // -----------------------------
 
-    function isGarbageTokenLine(line: string): boolean {
-        const t = (line || "").trim();
-        if (!t) return true;
-        // Examples: "E E", "E  E", or a single slash.
-        if (/^\/+\s*$/.test(t)) return true;
-        if (/^([A-Z])(?:\s+\1)+$/.test(t)) return true;
-        return false;
-    }
-
-    function extractTailAmountAndFlag(
-        line: string
-    ): { prefix: string; amount: string; flag: string } | null {
-        const t = (line || "").trim();
-        // Capture a trailing money token with optional trailing minus and optional 1-3 letter flag.
-        // Examples:
-        //  - "1014484 CANTALOUPE 7.89 N" => prefix="1014484 CANTALOUPE", amount="7.89", flag="N"
-        //  - "5.69 N" => prefix="", amount="5.69", flag="N"
-        //  - "7.80-" => prefix="", amount="7.80-", flag=""
-        const m = t.match(/^(.*?)(-?\d{1,7}\.\d{2}-?)(?:\s+([A-Z]{1,3}))?\s*$/);
-        if (!m) return null;
-        return {
-            prefix: (m[1] || "").trim(),
-            amount: (m[2] || "").trim(),
-            flag: (m[3] || "").trim(),
-        };
-    }
-
-    function isMoneyOnlyOrMoneyFlag(line: string): boolean {
-        const ex = extractTailAmountAndFlag(line);
-        if (!ex) return false;
-        // "prefix" must be empty to be considered money-only.
-        return !ex.prefix;
-    }
-
-    function semanticRepairLogicalLines(lines: string[]): string[] {
-        const input = (lines || []).map((l) => (l ?? "").trim()).filter(Boolean);
+    function mergeProduceTriples(lines: string[]) {
         const out: string[] = [];
 
-        for (let i = 0; i < input.length; i++) {
-            const a = input[i];
-            const b = input[i + 1];
-            const c = input[i + 2];
+        const qtyUnitPriceRe =
+            /\b\d+(?:\.\d+)?\s*(?:lb|lbs|kg|g|oz)\b.*\/\s*-?\$?\d{1,7}(?:[.,]\d{2})-?\s*$/i;
 
-            // 1) Drop pure garbage tokens like "E E".
-            if (isGarbageTokenLine(a)) continue;
+        for (let i = 0; i < lines.length; i++) {
+            const a = lines[i]?.trim() ?? "";
+            const b = lines[i + 1]?.trim() ?? "";
+            const c = lines[i + 2]?.trim() ?? "";
 
-            // 2) Standalone discount lines (e.g. "7.80-")
-            // Make them parseable by giving them a name.
-            if (isMoneyOnlyOrMoneyFlag(a)) {
-                const ex = extractTailAmountAndFlag(a);
-                const n = ex ? safeParseNumber(ex.amount) : null;
-                // Only treat as discount if negative.
-                if (n !== null && n < 0) {
-                    out.push(`DISCOUNT ${ex!.amount}`.trim());
-                    continue;
-                }
-            }
-
-            // 3) Pending item + price-shift swap.
-            // Pattern:
-            //   A: item row without amount (e.g. "1920277 FIESTA DIP")
-            //   B: item row with amount (e.g. "1014484 CANTALOUPE 7.89 N")
-            //   C: amount-only row (e.g. "5.69 N")
-            // We assume B's amount belongs to A, and C's amount belongs to B.
-            if (a && b && c) {
-                const bTail = extractTailAmountAndFlag(b);
-                const cTail = extractTailAmountAndFlag(c);
-
-                const bHasAmount = !!(bTail && bTail.amount && bTail.prefix);
-                const cIsAmountOnly = !!(cTail && cTail.amount && !cTail.prefix);
-
-                // A should not already have a trailing amount.
-                const aTail = extractTailAmountAndFlag(a);
-                const aHasAmount = !!(aTail && aTail.amount && aTail.prefix);
-
-                if (!aHasAmount && bHasAmount && cIsAmountOnly) {
-                    // A must look like an item row (letters/digits), not a header.
-                    if (/^[A-Z0-9]/i.test(a)) {
-                        const aRepaired = `${a} ${bTail!.amount}`.replace(/\s{2,}/g, " ").trim();
-                        const bRepaired = `${bTail!.prefix} ${cTail!.amount}${bTail!.flag ? " " + bTail!.flag : ""}`
-                            .replace(/\s{2,}/g, " ")
-                            .trim();
-                        out.push(aRepaired);
-                        out.push(bRepaired);
-                        i += 2; // consume A, B, C
-                        continue;
-                    }
-                }
+            // A = item name (no price at end)
+            // B = qty + unit price line (ends in /0.xx or similar)
+            // C = price-only total (e.g. 1.64)
+            if (
+                a &&
+                b &&
+                c &&
+                !moneyAtEndRe.test(a) &&
+                qtyUnitPriceRe.test(b) &&
+                isPriceOnlyLine(c)
+            ) {
+                out.push(`${a} ${b} ${c}`.replace(/\s{2,}/g, " ").trim());
+                i += 2;
+                continue;
             }
 
             out.push(a);
@@ -669,22 +579,21 @@ function parseReceiptTextDeterministic(
         return out;
     }
 
-    let logicalFixed = splitMultiSkuLines(logical);
+
+    let logicalFixed2 = mergeProduceTriples(logical);
+    console.log("logicalFixed2", logicalFixed2);
+
+
+    //let logicalFixed = logical;
+    let logicalFixed = splitMultiSkuLines(logicalFixed2);
+
+    console.log("logicalFixed BEFORE vendor", logicalFixed);
 
     if (adapter?.preprocessLogicalLines) {
         logicalFixed = adapter.preprocessLogicalLines(logicalFixed, { vendor });
     }
 
-    // ✅ Produce merge (vendor-agnostic, before semantic repair + parse)
-    const produceMerge = mergeProduceLines(logicalFixed);
-    logicalFixed = produceMerge.lines;
-    const produceMergedIdx = new Set<number>(produceMerge.mergedLineIndexes);
-
-    // Vendor-agnostic semantic repair
-    logicalFixed = semanticRepairLogicalLines(logicalFixed);
-
-    console.log("logicalFixed", logicalFixed);
-
+    console.log("logicalFixed AFTER vendor", logicalFixed);
 
     // ----- Totals extraction (generic bottom scan) -----
     let total: number | null = null;
@@ -724,8 +633,7 @@ function parseReceiptTextDeterministic(
     const items: any[] = [];
     let pricedLineCount = 0;
 
-    for (let li = 0; li < logicalFixed.length; li++) {
-        const l = logicalFixed[li];
+    for (const l of logicalFixed) {
         const low = l.toLowerCase();
         if (totalsRe.test(low) || tenderRe.test(low) || cashRe.test(low)) continue;
 
@@ -735,33 +643,23 @@ function parseReceiptTextDeterministic(
 
         pricedLineCount++;
 
-        // ✅ Detect produce (uses the full line; vendor-agnostic)
-        const produce = detectProduce(l, {
-            tolerance: Number(env("RECEIPT_PRODUCE_TOLERANCE", "0.02")),
-        });
-
-        // remove the last money token (rightmost) for generic naming
+        // remove the last money token (rightmost)
         let noPrice = l.trim();
         const lastToken = allMoney![allMoney!.length - 1];
         const idx = noPrice.lastIndexOf(lastToken);
         if (idx >= 0) noPrice = (noPrice.slice(0, idx) + noPrice.slice(idx + lastToken.length)).trim();
         noPrice = noPrice.replace(/\s*(?:[A-Z]{1,2})\s*$/i, "").trim(); // remove trailing Y/N/etc markers
 
-        // If produce, prefer detector's cleaned namePart (more accurate than generic chop)
-        const noPricePreferred = produce?.namePart ? produce.namePart : noPrice;
-
         // Extract vendorSku if present at beginning; else null (generic)
-        const skuMatch = noPricePreferred.match(/^(\d{5,8})\b\s*(.*)$/);
+        const skuMatch = noPrice.match(/^(\d{5,8})\b\s*(.*)$/);
         const vendorSku = skuMatch ? skuMatch[1] : null;
-        const nameRaw = (skuMatch ? (skuMatch[2] ?? "") : noPricePreferred).trim();
+        const nameRaw = (skuMatch ? (skuMatch[2] ?? "") : noPrice).trim();
         const name = nameRaw.replace(/\s{2,}/g, " ").trim();
         if (!name) continue;
 
         let originalQuantity: number | null = 1;
         let originalUnit: string | null = null;
-
-        // ✅ Produce-aware unitPrice + optional weight/unit capture (no schema break yet)
-        let unitPrice: number | null = produce?.unitPrice ?? lineTotal;
+        let unitPrice: number | null = lineTotal;
 
         const unitMatch = name.match(unitRe);
         if (unitMatch?.[1]) originalUnit = normalizeUnit(unitMatch[1]);
@@ -776,20 +674,6 @@ function parseReceiptTextDeterministic(
             originalUnit,
             unitPrice,
             lineTotal,
-
-            // ✅ OPTIONAL: safe to include even before DB schema changes,
-            // as long as your later pipeline tolerates extra fields.
-            // If you want to delay persistence, keep these in-memory only for now.
-            weight: produce?.weight ?? null,
-            unit: produce?.unit ?? null,
-            produceMeta: produce
-                ? {
-                    confidenceScore: produce.confidenceScore,
-                    reason: produce.reason,
-                    mathValidated: produce.mathValidated,
-                    mergeApplied: produceMergedIdx.has(li),
-                }
-                : null,
         });
     }
 
@@ -939,17 +823,10 @@ export async function extractReceipt(file: {
 
         // Force OCR provider selection (default google via env)
         if (provider === "google") {
-            const mode = getOcrMode();
-            console.log("[receiptOcr] mode env =", process.env.RECEIPT_OCR_MODE);
-            console.log("[receiptOcr] mode normalized =", mode);
             const texts: string[] = [];
             for (const png of pagePngs) {
-                const doc = await googleVisionDocument(png);
-                const text = doc.text ?? "";
-                const geoLines = doc.fullTextAnnotation ? buildGeoLines(doc.fullTextAnnotation) : null;
-                const geoText = geoLines && geoLines.length ? geoLines.join("\n") : undefined;
-                const picked = chooseOcrText({ text, geoText, mode });
-                if (picked.chosenText) texts.push(picked.chosenText);
+                const t = await googleVisionDocumentText(png);
+                if (t) texts.push(t);
             }
             const fullText = texts.join("\n\n");
             const parsed = parseReceiptTextDeterministic(fullText);
@@ -961,7 +838,6 @@ export async function extractReceipt(file: {
                     provider: "google",
                     mode: "pdf-render+ocr",
                     pages: pagePngs.length,
-                    ocrMode: mode,
                 },
             };
 
@@ -1030,27 +906,13 @@ export async function extractReceipt(file: {
     // ✅ Image receipts path (jpg/png/webp)
     if (mime.includes("jpeg") || mime.includes("jpg") || mime.includes("png") || mime.includes("webp")) {
         if (provider === "google") {
-            const mode = getOcrMode();
-            console.log("[receiptOcr] mode env =", process.env.RECEIPT_OCR_MODE);
-            console.log("[receiptOcr] mode normalized =", mode);
-            const doc = await googleVisionDocument(file.buffer);
-            const text = doc.text ?? "";
-            const geoLines = doc.fullTextAnnotation ? buildGeoLines(doc.fullTextAnnotation) : null;
-            const geoText = geoLines && geoLines.length ? geoLines.join("\n") : undefined;
-            const picked = chooseOcrText({ text, geoText, mode });
-            console.log("[receiptOcr] pick", picked.chosenMode, picked.scores);
-
-            const parsed = parseReceiptTextDeterministic(picked.chosenText);
+            const fullText = await googleVisionDocumentText(file.buffer);
+            const parsed = parseReceiptTextDeterministic(fullText ?? "");
 
             const result: ReceiptOcrExtractResult = {
                 ...parsed,
                 provider: "google",
-                rawJson: {
-                    provider: "google",
-                    mode: "image-ocr",
-                    ocrMode: picked.chosenMode,
-                    ocrModeScores: picked.scores,
-                },
+                rawJson: { provider: "google", mode: "image-ocr" },
             };
 
             // Optional OpenAI fallback (never blocks)
