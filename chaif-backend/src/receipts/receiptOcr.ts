@@ -604,6 +604,17 @@ function parseReceiptTextDeterministic(
     const headerNoiseRe =
         /\b(orders\s*&\s*purchases|member|approved|purchase|thank\s*you|customer\s*copy|order\s*summary|order\s*details|delivered|your\s*package\s+was\s+left|sold\s+by|supplied\s+by|return\s+items?)\b/i;
 
+    // Column header line that should never become an item or be merged
+    const columnHeaderRe = /\b(weight\s*\/\s*pc|unit\s*price|total\s*price|qty)\b/i;
+
+    // Non-item metadata lines that must never merge into first product row
+    const metaHeaderRe = /\b(item\s*count|customer\s*info|cashier|station|order\s*#|invoice\s*#|date\s*\/\s*time)\b/i;
+
+    // Lines that are NOT items and frequently merge into the first item
+// (no $ amount, no weight totals, just status/meta)
+const nonItemMetaRe =
+/\b(closed\s+to\s+credit\s+card\s+purchase|closed\s+to\s+credit\s+card|customer\s+info|item\s*count|cashier|station)\b/i;
+
     // matches trailing money token + optional trailing minus + optional 1-3 letter flag
     function extractTailAmountAndFlag(line: string): { prefix: string; amount: string; flag: string } | null {
         const t = (line || "").trim();
@@ -769,21 +780,46 @@ function parseReceiptTextDeterministic(
     }
 
 
-    //console.log("logical BEFORE splitMultiSkuLines", logical);
+    console.log("logical BEFORE splitMultiSkuLines", logical);
     let logicalFixed = splitMultiSkuLines(logical);
-    //console.log("logical AFTER splitMultiSkuLines", logicalFixed);
+    console.log("logical AFTER splitMultiSkuLines", logicalFixed);
     if (adapter?.preprocessLogicalLines) logicalFixed = adapter.preprocessLogicalLines(logicalFixed, { vendor });
 
     // Produce merge (your module)
-    //console.log("logical BEFORE produceMerge", logicalFixed);
+    // ✅ Prevent produceMerge from merging table headers into the first product line (F1 issue)
+// -----------------------
+// Pre-produceMerge scrub:
+// remove non-item meta lines that can pollute first product row.
+// Only remove if the line has NO price token.
+// -----------------------
+// ✅ Prevent produceMerge from merging table headers into the first product line (F1 issue)
+logicalFixed = logicalFixed.filter((l) => {
+    const s = (l || "").trim();
+    if (!s) return false;
+  
+    // If it looks like a column header and has NO money token, drop it
+    if (columnHeaderRe.test(s) && !pickLineTotalToken(s)) return false;
+
+      // drop metadata header lines (no money)
+  if (metaHeaderRe.test(s) && !pickLineTotalToken(s)) return false;
+  
+    // otherwise drop known meta/status lines
+    if (nonItemMetaRe.test(s)) return false;
+  
+    return true;
+  });
+
+
+
+    console.log("logical BEFORE produceMerge", logicalFixed);
     const produceMerge = mergeProduceLines(logicalFixed);
-    //console.log("logical AFTER produceMerge", produceMerge.lines);
+    console.log("logical AFTER produceMerge", produceMerge.lines);
     logicalFixed = produceMerge.lines;
     const produceMergedIdx = new Set<number>(produceMerge.mergedLineIndexes);
 
-    //console.log("logical BEFORE semanticRepairLogicalLines", logicalFixed);
+    console.log("logical BEFORE semanticRepairLogicalLines", logicalFixed);
     logicalFixed = semanticRepairLogicalLines(logicalFixed);
-    //console.log("logical AFTER semanticRepairLogicalLines", logicalFixed);
+    console.log("logical AFTER semanticRepairLogicalLines", logicalFixed);
 
     // -----------------------
     // Totals extraction (bottom scan)
