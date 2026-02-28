@@ -42,10 +42,14 @@ enum ActorType {
 
 enum ReceiptsStatus {
   RECEIVED
-  PARSED
   NORMALIZED
   NEEDS_REVIEW
+  READY_TO_POST
+  POSTED
   ERROR
+  APPROVED
+  REJECTED
+
 }
 
 enum HouseholdMemberRole {
@@ -264,6 +268,15 @@ model ReceiptRaw {
   normalized  NormalizedLineItem[]
   sourcedLots InventoryLot[]       @relation("LotSourceReceipt")
 
+  // OCR / extraction gating (write-once)
+  confidenceScore   Decimal? @db.Decimal(4, 3) // e.g. 0.000 - 1.000
+  needsReview       Boolean  @default(false)
+  reviewReasonCodes Json?    // e.g. ["LOW_CONFIDENCE","MISSING_TOTAL","TOO_FEW_LINES"]
+  ocrProvider       String?  // "google", "openai", etc.
+  ocrMode           String?  // "geo" | "text"
+  ocrParserVersion  String?  // e.g. "receiptOcr@2026-02-27"
+
+
   // ✅ indexes (LOCKED + perf)
   @@index([householdId, createdAt])
   @@index([vendor])
@@ -303,6 +316,26 @@ model ReceiptLineRaw {
 
   // 1:1 normalization row (recommended)
   normalized NormalizedLineItem?
+
+    // Write-once name pipeline (no redo)
+  nameRaw                String? // original parsed name from OCR pipeline
+  displayName            String? // cleaned for UI
+  normalizedName         String? // normalized for matching/dedup
+  nameNormalizerVersion  String? // e.g. "nameNorm@2026-02-27"
+  nameNormalizerHash     String? // hash of inputs/algorithm/config
+  categoryRaw         String?
+  categoryRuleVersion String?
+  isNonItem     Boolean  @default(false)
+  nonItemReason String?
+  expiryDaysRaw     Int?
+expiryDateRaw     DateTime?
+expiryConfidence Decimal? @db.Decimal(4,3)
+expiryRuleVersion String?
+
+  // User override (only these may change)
+  isUserEdited    Boolean  @default(false)
+  userDisplayName String?
+  userEditedAt    DateTime?
 
   @@unique([receiptId, lineNumber])
   @@index([receiptId])
